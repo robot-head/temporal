@@ -657,61 +657,162 @@ enum ParseVariant {
     Time,
 }
 
-#[inline]
-fn parse_ixdtf(source: &[u8], variant: ParseVariant) -> TemporalResult<IxdtfParseRecord> {
-    fn cast_handler<'a>(
-        _: &mut IxdtfParser<'a>,
-        handler: impl FnMut(Annotation<'a>) -> Option<Annotation<'a>>,
-    ) -> impl FnMut(Annotation<'a>) -> Option<Annotation<'a>> {
-        handler
+/// A parser that wraps [`IxdtfParser`] and enforces Temporal specific invariants.
+#[derive(Debug)]
+pub struct TemporalParser<'a> {
+    parser: IxdtfParser<'a>,
+    first_calendar: Option<Annotation<'a>>,
+    critical_duplicate_calendar: bool,
+}
+
+impl<'a> TemporalParser<'a> {
+    /// Create a new [`TemporalParser`] from a UTF-8 byte slice.
+    pub fn from_utf8(source: &'a [u8]) -> Self {
+        Self {
+            parser: IxdtfParser::from_utf8(source),
+            first_calendar: None,
+            critical_duplicate_calendar: false,
+        }
     }
 
-    let mut first_calendar: Option<Annotation> = None;
-    let mut critical_duplicate_calendar = false;
-    let mut parser = IxdtfParser::from_utf8(source);
+    /// Create a new [`TemporalParser`] from a string slice.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(source: &'a str) -> Self {
+        Self::from_utf8(source.as_bytes())
+    }
 
-    let handler = cast_handler(&mut parser, |annotation: Annotation<'_>| {
-        if annotation.key == "u-ca".as_bytes() {
-            match first_calendar {
-                Some(ref cal) => {
-                    if cal.critical || annotation.critical {
-                        critical_duplicate_calendar = true
+    fn parse_variant(&mut self, variant: ParseVariant) -> TemporalResult<IxdtfParseRecord<'a>> {
+        let handler = |annotation: Annotation<'a>| {
+            if annotation.key == b"u-ca" {
+                match self.first_calendar {
+                    Some(ref cal) => {
+                        if cal.critical || annotation.critical {
+                            self.critical_duplicate_calendar = true;
+                        }
                     }
+                    None => self.first_calendar = Some(annotation),
                 }
-                None => first_calendar = Some(annotation),
+                return None;
             }
-            return None;
+
+            // Make the parser handle any unknown annotation.
+            Some(annotation)
+        };
+
+        let mut record = match variant {
+            ParseVariant::YearMonth => self
+                .parser
+                .parse_year_month_with_annotation_handler(handler),
+            ParseVariant::MonthDay => self.parser.parse_month_day_with_annotation_handler(handler),
+            ParseVariant::DateTime => self.parser.parse_with_annotation_handler(handler),
+            ParseVariant::Time => self.parser.parse_time_with_annotation_handler(handler),
+        }
+        .map_err(|e| TemporalError::range().with_message(format!("{e}")))?;
+
+        if self.critical_duplicate_calendar {
+            return Err(TemporalError::range()
+                .with_message("Duplicate calendar value with critical flag found."));
         }
 
-        // Make the parser handle any unknown annotation.
-        Some(annotation)
-    });
+        if variant != ParseVariant::Time && record.date.is_none() {
+            return Err(
+                TemporalError::range().with_message("DateTime strings must contain a Date value.")
+            );
+        }
 
-    let mut record = match variant {
-        ParseVariant::YearMonth => parser.parse_year_month_with_annotation_handler(handler),
-        ParseVariant::MonthDay => parser.parse_month_day_with_annotation_handler(handler),
-        ParseVariant::DateTime => parser.parse_with_annotation_handler(handler),
-        ParseVariant::Time => parser.parse_time_with_annotation_handler(handler),
-    }
-    .map_err(|e| TemporalError::range().with_message(format!("{e}")))?;
+        record.calendar = self.first_calendar.take().map(|v| v.value);
 
-    if critical_duplicate_calendar {
-        // TODO: Add tests for the below.
-        // Parser handles non-matching calendar, so the value thrown here should only be duplicates.
-        return Err(TemporalError::range()
-            .with_message("Duplicate calendar value with critical flag found."));
+        Ok(record)
     }
 
-    // Validate that the DateRecord exists.
-    if variant != ParseVariant::Time && record.date.is_none() {
-        return Err(
-            TemporalError::range().with_message("DateTime strings must contain a Date value.")
-        );
+    /// Parse the source as a `DateTime` string.
+    pub fn parse_date_time(&mut self) -> TemporalResult<IxdtfParseRecord<'a>> {
+        let record = self.parse_variant(ParseVariant::DateTime)?;
+
+        if record.offset == Some(UtcOffsetRecordOrZ::Z) {
+            return Err(TemporalError::range()
+                .with_message("UTC designator is not valid for DateTime parsing."));
+        }
+
+        Ok(record)
     }
 
-    record.calendar = first_calendar.map(|v| v.value);
+    /// Parse the source as a `ZonedDateTime` string.
+    pub fn parse_zoned_date_time(&mut self) -> TemporalResult<IxdtfParseRecord<'a>> {
+        let record = self.parse_variant(ParseVariant::DateTime)?;
 
-    Ok(record)
+        if record.tz.is_none() {
+            return Err(TemporalError::range()
+                .with_message("Time zone annotation is required for parsing a zoned date time."));
+        }
+
+        Ok(record)
+    }
+
+    /// Parse the source as an `Instant` string.
+    pub fn parse_instant(&mut self) -> TemporalResult<IxdtfParseInstantRecord> {
+        let record = self.parse_variant(ParseVariant::DateTime)?;
+
+        let IxdtfParseRecord {
+            date: Some(date),
+            time: Some(time),
+            offset: Some(offset),
+            ..
+        } = record
+        else {
+            return Err(
+                TemporalError::range().with_message("Required fields missing from Instant string.")
+            );
+        };
+
+        Ok(IxdtfParseInstantRecord { date, time, offset })
+    }
+
+    /// Parse the source as a `YearMonth` string.
+    pub fn parse_year_month(&mut self) -> TemporalResult<IxdtfParseRecord<'a>> {
+        let record = self.parse_variant(ParseVariant::YearMonth)?;
+
+        if record.offset == Some(UtcOffsetRecordOrZ::Z) {
+            return Err(TemporalError::range()
+                .with_message("UTC designator is not valid for DateTime parsing."));
+        }
+
+        Ok(record)
+    }
+
+    /// Parse the source as a `MonthDay` string.
+    pub fn parse_month_day(&mut self) -> TemporalResult<IxdtfParseRecord<'a>> {
+        self.parse_variant(ParseVariant::MonthDay)
+    }
+
+    /// Parse the source as a `Time` string.
+    pub fn parse_time(&mut self) -> TemporalResult<TimeRecord> {
+        let record = self.parse_variant(ParseVariant::Time)?;
+
+        if record.offset == Some(UtcOffsetRecordOrZ::Z) {
+            return Err(TemporalError::range()
+                .with_message("UTC designator is not valid for DateTime parsing."));
+        }
+
+        record.time.temporal_unwrap()
+    }
+
+    /// Extract a calendar from any allowed calendar format.
+    pub fn parse_calendar(&mut self) -> Option<&'a [u8]> {
+        if let Ok(r) = self
+            .parse_variant(ParseVariant::DateTime)
+            .map(|r| r.calendar)
+        {
+            return Some(r.unwrap_or(&[]));
+        }
+        None
+    }
+}
+
+#[inline]
+fn parse_ixdtf(source: &[u8], variant: ParseVariant) -> TemporalResult<IxdtfParseRecord> {
+    let mut parser = TemporalParser::from_utf8(source);
+    parser.parse_variant(variant)
 }
 
 /// A utility function for parsing a `DateTime` string
@@ -740,10 +841,10 @@ pub(crate) fn parse_zoned_date_time(source: &str) -> TemporalResult<IxdtfParseRe
     Ok(record)
 }
 
-pub(crate) struct IxdtfParseInstantRecord {
-    pub(crate) date: DateRecord,
-    pub(crate) time: TimeRecord,
-    pub(crate) offset: UtcOffsetRecordOrZ,
+pub struct IxdtfParseInstantRecord {
+    pub date: DateRecord,
+    pub time: TimeRecord,
+    pub offset: UtcOffsetRecordOrZ,
 }
 
 /// A utility function for parsing an `Instant` string
